@@ -21,9 +21,16 @@ env:
 
 jobs:
   build:
-    # arm64 native runner: Dockerfile (and the kw cluster) is arm64 throughout,
-    # and QEMU-emulating a Rust LTO release build is far slower than it's worth.
-    runs-on: ubuntu-24.04-arm
+    # Native runner per arch, in parallel: arm64 job on ubuntu-24.04-arm,
+    # amd64 job on ubuntu-24.04. Runnative avoids QEMU (emulated Rust LTO
+    # release builds are far slower than they're worth). Each pushes its own
+    # arch-suffixed image.
+    name: build-${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/arm64, linux/amd64]
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - name: Checkout upstream main
         uses: actions/checkout@v4
@@ -48,13 +55,41 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "tag=main-$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and push (${{ matrix.platform }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
+
+  manifest:
+    name: multi-arch-manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Compute tag
+        id: tag
+        run: |
+          SHA=$(git ls-remote https://github.com/azrtydxb/Fastllm-proxy.git refs/heads/main | cut -f1 | cut -c1-7)
+          echo "tag=main-$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create + push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-arm64" "${IMAGE}:${TAG}-amd64"
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TAG: ${{ steps.tag.outputs.tag }}
